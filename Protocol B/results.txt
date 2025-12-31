@@ -1,0 +1,45 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║  Protocol B (v4): Stochastic ΩΛ and the Hubble Tension               ║
+║  With: θ* root finding, consistent D_L, corrected time direction     ║
+╚══════════════════════════════════════════════════════════════════════╝
+    
+======================================================================
+Protocol B (v4): Stochastic ΩΛ and Hubble Tension
+  CMB: θ* = r_s/D_A root finding with fixed ω's + tail correction
+  SNe: consistent D_L(z) = (c/H0)*χ(z)*(1+z)
+======================================================================
+σ_ΩΛ = 0.12, τ_c = 0.4, E_cap = 10.0
+300 realizations, 16 cores
+
+  50/300...
+  100/300...
+  150/300...
+  200/300...
+  250/300...
+  300/300...
+======================================================================
+Protocol B Results (v4): Stochastic ΩΛ and Hubble Tension
+======================================================================
+Realizations: 300 (CMB NaN rate: 1.3%)
+ΩΛ fluctuation amplitude: σ = 0.120
+Correlation time: τ_c = 0.40 H₀⁻¹
+
+H₀ Inference Results:
+  Late (SNe):     H₀ = 73.77 ± 0.27
+  Late (low-z):   H₀ = 75.49 ± 2.07
+  Early (CMB):    H₀ = 69.11 ± 8.04
+
+Hubble Tension Metrics:
+  ⟨δH⟩ = 8.28%
+  σ_patch = 13.57%
+  σ_intra = 1.46%
+
+Observed: 8.3% tension
+Time: 1.0s
+======================================================================
+
+TARGETS:
+  sigma_patch_in_range: ✓
+  sigma_intra_acceptable: ✓
+  produces_tension: ✓
+Saved: protocol_b_v4_results.png
