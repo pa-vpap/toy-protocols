@@ -1,0 +1,33 @@
+{
+  "evaluation": {
+    "minkowski_2d": {
+      "n_tests": 6.0,
+      "alpha_mean": 0.9161509378232539,
+      "alpha_std": 0.08513188495762228,
+      "d_mm_mean": 1.8630486204619994,
+      "d_mm_std": 0.014005397785763153
+    },
+    "minkowski_4d": {
+      "n_tests": 6.0,
+      "alpha_mean": 2.959739179164775,
+      "alpha_std": 0.25841064709379064,
+      "d_mm_mean": 2.9782768186077906,
+      "d_mm_std": 0.07712913763687076
+    },
+    "trans_percolation_03": {
+      "n_tests": 6.0,
+      "alpha_mean": -0.02553171115243908,
+      "alpha_std": 0.06495042221197257,
+      "d_mm_mean": 1.5015344313870447,
+      "d_mm_std": 0.0011803806443434657
+    },
+    "sequential_growth_04": {
+      "n_tests": 6.0,
+      "alpha_mean": 0.06168851101200942,
+      "alpha_std": 0.05799769773779746,
+      "d_mm_mean": 1.5,
+      "d_mm_std": 0.0
+    }
+  },
+  "delta": "adaptive"
+}
