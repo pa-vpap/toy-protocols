@@ -1,1232 +1,695 @@
+#!/usr/bin/env python3
 """
-Protocol A: Emergent Dimension Test - FINAL HARDENED VERSION
-============================================================
+Protocol C (Toy Model): Boltzmann-weighted selection toward "structured" point clouds
+===============================================================================
 
-WHAT THIS IMPLEMENTATION DOES (and does not):
---------------------------------------------
+This is NOT causal-set Protocol C. It's an environment-friendly toy analogue:
 
-INTRINSIC (order-only):
-  • Myrheim–Meyer d_MM uses ONLY the causal order (transitive closure).
-  • Chain-time ("intrinsic time" τ) is computed from the order only.
+State space:
+  - Configurations are point clouds C ∈ R^{N×D}
+  - Two ensembles:
+      * Entropic: isotropic Gaussian in ambient D
+      * Sprinkled-like: intrinsic-d manifold projected into ambient D (+ small noise)
 
-EXTRINSIC (sprinklings only):
-  • For Minkowski sprinklings, we ALSO store embedding coordinates.
-  • For those sprinklings, we measure V₃ using COORDINATE TIME t-bands.
-    This gives clean continuum scaling α ≈ d-1.
+Energy / "action" S(C) (scale-invariant by construction):
+  Choose one:
+    - "knn_graph": mean kNN edge length (scale-normalized cloud)
+    - "mst": mean MST edge length (approx via Prim; O(N^2), ok for N~100)
+        - "pair_dist": mean random-pair squared distance (exactly constant under RMS normalization, up to sampling noise)
 
-V₃ DEFINITION (correct):
-  • V₃(band) = width(band) = size of maximum antichain in that band.
-  • Width is computed EXACTLY via Dilworth using maximum bipartite matching
-    on the FULL order relation (closure), never links.
+Boltzmann weighting:
+  w(C; β) ∝ exp(-β S(C))
 
-PATCHES:
-  1) Tips for diamonds (unique past/future tips for sprinklings)
-  2) Thickened bands / stable banding; greedy multistart fallback
-  3) Midpoint time τ(x)=min(d(p,x), d(x,q)) for diamond chain-time
-  4) Store links (Hasse) separately from closure
-  4.1) Dilworth width uses closure, not links (CRITICAL)
-  5) Coordinate-time V₃ for sprinklings + robust peak-based fit + O(N) binning
+Diagnostics vs β:
+  1) Manifoldness drift: TwoNN intrinsic dimension estimate (optionally on PCA-reduced coords)
+  2) Prevalence: P(sprinkled | β) using TRUE labels (not thresholding S)
+  3) Landscape / ruggedness: Metropolis acceptance rate + Var(ΔS) under local moves
 
-INTERPRETATION:
-  • For sprinklings: α measures continuum spatial volume scaling in the embedding.
-  • For growth models: α~0 under intrinsic time is a useful “model fingerprint”.
-  • d_MM is always intrinsic (order-only).
-
-Outputs:
-  • protocol_a_final_report.txt
-  • protocol_a_final_results.png
-  • protocol_a_final_data.json
+Key fixes vs the earlier prototype:
+  - Scale normalization per cloud (removes trivial "select smaller variance")
+  - Uses true labels for prevalence
+  - Fast-ish S computation (pair sampling / kNN graph)
+  - Ruggedness uses ΔS / acceptance (not just Var(S under noise))
 """
 
-import numpy as np
-from scipy import stats
-from scipy.special import gamma as gamma_func
-from scipy.optimize import brentq
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import maximum_bipartite_matching
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional, Set, Union
-import json
+from __future__ import annotations
+
+import argparse
 import matplotlib
-matplotlib.use("Agg")
+import numpy as np
 import matplotlib.pyplot as plt
+from dataclasses import dataclass, field, replace
+from typing import Literal, Tuple, Optional, List
 
 
-# =============================================================================
-# SECTION 1: CAUSAL SET DATA STRUCTURE
-# =============================================================================
+# ----------------------------
+# Config
+# ----------------------------
 
-class CausalSet:
-    """
-    Stores TRANSITIVE CLOSURE in future/past.
-    Stores LINKS (Hasse edges) separately in links_future/links_past.
-    Optionally stores embedding coordinates for sprinklings (Patch 5).
-    """
-
-    def __init__(self, n_elements: int, label: str = "unlabeled"):
-        self.n = n_elements
-        self.label = label
-
-        # Closure
-        self.future: Dict[int, Set[int]] = defaultdict(set)
-        self.past: Dict[int, Set[int]] = defaultdict(set)
-
-        # Links (Hasse / cover relations)
-        self.links_future: Dict[int, Set[int]] = defaultdict(set)
-        self.links_past: Dict[int, Set[int]] = defaultdict(set)
-
-        # Tips / interior (sprinkled diamonds)
-        self.past_tip: Optional[int] = None
-        self.future_tip: Optional[int] = None
-        self.interior: Optional[Set[int]] = None
-
-        # Patch 5: Coordinates for sprinklings
-        # coords[i] = (t, x) in 2D; coords[i] = (t, x, y, z) in 4D
-        self.coords: Optional[Dict[int, Tuple[float, ...]]] = None
-        self.T: Optional[float] = None  # diamond height in coordinate time
-
-    def add_relation(self, i: int, j: int):
-        """Add a LINK i ≺ j, and also include it in closure."""
-        self.links_future[i].add(j)
-        self.links_past[j].add(i)
-        self.future[i].add(j)
-        self.past[j].add(i)
-
-    def add_closure_relation(self, i: int, j: int):
-        """Add a CLOSURE relation i ≺ j without touching link graph."""
-        self.future[i].add(j)
-        self.past[j].add(i)
-
-    def precedes(self, i: int, j: int) -> bool:
-        return j in self.future[i]
-
-    def comparable(self, i: int, j: int) -> bool:
-        return self.precedes(i, j) or self.precedes(j, i)
-
-    def interval(self, x: int, z: int) -> Set[int]:
-        """Return [x,z] = {y : x ≼ y ≼ z}"""
-        if x == z:
-            return {x}
-        if not self.precedes(x, z):
-            return set()
-        return (self.future[x] & self.past[z]) | {x, z}
-
-    def count_relations_in_interval(self, elements: Set[int]) -> int:
-        """
-        Count ordered comparable pairs (a ≺ b) within 'elements', each counted once.
-        """
-        total = 0
-        for a in elements:
-            total += len(self.future[a] & elements)
-        return total
-
-    def n_relations(self) -> int:
-        return sum(len(v) for v in self.future.values())
-
-
-def ensure_transitive_closure(cs: CausalSet):
-    """
-    Ensure closure is complete.
-    Uses add_closure_relation so links remain sparse.
-    """
-    for k in range(cs.n - 1, -1, -1):
-        stack = list(cs.future[k])
-        visited = set(stack)
-        while stack:
-            j = stack.pop()
-            for m in cs.future[j]:
-                if m not in visited:
-                    visited.add(m)
-                    cs.add_closure_relation(k, m)
-                    stack.append(m)
-
-
-# =============================================================================
-# SECTION 2: WIDTH (DILWORTH) VIA MAXIMUM BIPARTITE MATCHING
-# =============================================================================
-
-class WidthComputer:
-    """
-    width(P) = n - |maximum matching| on bipartite graph with edges i->j iff i≺j.
-    MUST use closure edges (cs.future), not links, for correct Dilworth width.
-    """
-
-    @staticmethod
-    def compute_width(
-        cs: CausalSet,
-        elements: Optional[Set[int]] = None,
-        use_links: bool = False,  # keep for debugging; MUST be False for correctness
-    ) -> int:
-        if elements is None:
-            elements = set(range(cs.n))
-        n = len(elements)
-        if n <= 1:
-            return n
-
-        elem_list = sorted(elements)
-        elem_to_idx = {e: i for i, e in enumerate(elem_list)}
-        elem_set = set(elements)
-
-        succ = cs.links_future if (use_links and cs.links_future) else cs.future
-
-        rows, cols = [], []
-        for ei in elem_list:
-            i = elem_to_idx[ei]
-            for ej in succ[ei]:
-                if ej in elem_set:
-                    rows.append(i)
-                    cols.append(elem_to_idx[ej])
-
-        if not rows:
-            return n
-
-        data = np.ones(len(rows), dtype=np.int32)
-        biadj = csr_matrix((data, (rows, cols)), shape=(n, n))
-        matching = maximum_bipartite_matching(biadj, perm_type="column")
-        match_size = int(np.sum(matching != -1))
-        return n - match_size
-
-    @staticmethod
-    def compute_width_greedy_multistart(
-        cs: CausalSet,
-        elements: Optional[Set[int]] = None,
-        n_starts: int = 24,
-        seed: int = 42
-    ) -> int:
-        if elements is None:
-            elements = set(range(cs.n))
-        elems = list(elements)
-        if len(elems) <= 1:
-            return len(elems)
-
-        rng = np.random.default_rng(seed)
-        best = 0
-        for _ in range(max(1, n_starts)):
-            rng.shuffle(elems)
-            antichain: List[int] = []
-            for e in elems:
-                if all(not cs.comparable(e, a) for a in antichain):
-                    antichain.append(e)
-            best = max(best, len(antichain))
-        return best
-
-    @staticmethod
-    def verify_dilworth() -> bool:
-        from scipy.sparse import csr_matrix
-
-        ok = True
-
-        # Two-layer, width=2
-        n = 4
-        A = csr_matrix(([1, 1, 1, 1], ([0, 0, 1, 1], [2, 3, 2, 3])), shape=(n, n))
-        m = maximum_bipartite_matching(A, perm_type="column")
-        w = n - np.sum(m != -1)
-        ok &= (w == 2)
-
-        # Chain, width=1
-        A = csr_matrix(([1,1,1,1,1,1], ([0,0,0,1,1,2], [1,2,3,2,3,3])), shape=(4,4))
-        m = maximum_bipartite_matching(A, perm_type="column")
-        w = 4 - np.sum(m != -1)
-        ok &= (w == 1)
-
-        # Antichain, width=4
-        A = csr_matrix((4,4))
-        m = maximum_bipartite_matching(A, perm_type="column")
-        w = 4 - np.sum(m != -1)
-        ok &= (w == 4)
-
-        return ok
-
-
-# =============================================================================
-# SECTION 3: V3 COMPUTATION + ROBUST FITS
-# =============================================================================
-
-class V3Computer:
-    """
-    Provides:
-      • chain-time thickened-band V3 for non-embedded growth models
-      • coordinate-time band V3 for sprinkled diamonds (Patch 5)
-      • robust peak-based expanding-only fitting for coordinate-time series
-    """
-
-    # ---------- intrinsic chain time ----------
-    @staticmethod
-    def compute_intrinsic_time(cs: CausalSet) -> Dict[int, int]:
-        tau = {i: 0 for i in range(cs.n)}
-        in_deg = {i: len(cs.past[i]) for i in range(cs.n)}
-        queue = [i for i in range(cs.n) if in_deg[i] == 0]
-
-        while queue:
-            x = queue.pop(0)
-            for y in cs.future[x]:
-                tau[y] = max(tau[y], tau[x] + 1)
-                in_deg[y] -= 1
-                if in_deg[y] == 0:
-                    queue.append(y)
-        return tau
-
-    @staticmethod
-    def compute_intrinsic_time_from_source(cs: CausalSet, source: int) -> Dict[int, int]:
-        tau = {i: -10**9 for i in range(cs.n)}
-        tau[source] = 0
-        in_deg = {i: len(cs.past[i]) for i in range(cs.n)}
-        queue = [i for i in range(cs.n) if in_deg[i] == 0]
-
-        while queue:
-            x = queue.pop(0)
-            for y in cs.future[x]:
-                if tau[x] > -10**8:
-                    tau[y] = max(tau[y], tau[x] + 1)
-                in_deg[y] -= 1
-                if in_deg[y] == 0:
-                    queue.append(y)
-
-        for k, v in tau.items():
-            if v < 0:
-                tau[k] = 0
-        return tau
-
-    @staticmethod
-    def compute_intrinsic_time_to_sink(cs: CausalSet, sink: int) -> Dict[int, int]:
-        tplus = {i: -10**9 for i in range(cs.n)}
-        tplus[sink] = 0
-
-        in_deg = {i: len(cs.past[i]) for i in range(cs.n)}
-        queue = [i for i in range(cs.n) if in_deg[i] == 0]
-        topo = []
-        while queue:
-            x = queue.pop(0)
-            topo.append(x)
-            for y in cs.future[x]:
-                in_deg[y] -= 1
-                if in_deg[y] == 0:
-                    queue.append(y)
-
-        for x in reversed(topo):
-            if x == sink:
-                continue
-            best = -10**9
-            for y in cs.future[x]:
-                if tplus[y] > -10**8:
-                    best = max(best, tplus[y] + 1)
-            if best > -10**8:
-                tplus[x] = best
-
-        for k, v in tplus.items():
-            if v < 0:
-                tplus[k] = 0
-        return tplus
-
-    @staticmethod
-    def compute_midpoint_time_for_diamond(cs: CausalSet) -> Dict[int, int]:
-        assert cs.past_tip is not None and cs.future_tip is not None
-        tminus = V3Computer.compute_intrinsic_time_from_source(cs, cs.past_tip)
-        tplus = V3Computer.compute_intrinsic_time_to_sink(cs, cs.future_tip)
-        return {i: int(min(tminus[i], tplus[i])) for i in range(cs.n)}
-
-    @staticmethod
-    def compute_V3_thickened_chain_time(
-        cs: CausalSet,
-        tau: Dict[int, int],
-        delta: Optional[int] = None,
-        use_exact: bool = True,
-        exact_cutoff: int = 3000,
-    ) -> List[Tuple[int, int]]:
-        tau_max = max(tau.values()) if tau else 0
-        if delta is None or delta <= 0:
-            if tau_max <= 15:
-                delta = max(1, tau_max // 6)
-            else:
-                delta = max(3, min(int(0.08 * tau_max), tau_max // 4))
-
-        # group by tau
-        slices: Dict[int, Set[int]] = defaultdict(set)
-        for e, t in tau.items():
-            slices[t].add(e)
-
-        v3 = []
-        tau_values = list(range(delta, tau_max - delta + 1)) or ([tau_max // 2] if tau_max > 0 else [0])
-
-        for t in tau_values:
-            band: Set[int] = set()
-            for tt in range(t - delta, t + delta + 1):
-                band |= slices.get(tt, set())
-            if len(band) < 2:
-                continue
-
-            if use_exact and len(band) <= exact_cutoff:
-                w = WidthComputer.compute_width(cs, band, use_links=False)
-            else:
-                w = WidthComputer.compute_width_greedy_multistart(cs, band, n_starts=24, seed=42)
-            v3.append((t, w))
-        return v3
-
-    # ---------- coordinate time (Patch 5) ----------
-    @staticmethod
-    def compute_V3_coordinate_time(
-        cs: CausalSet,
-        n_bins: int = 20,
-        use_exact: bool = True,
-        exact_cutoff: int = 6000,
-        enable_logging: bool = False,
-    ) -> Tuple[List[Tuple[float, int]], Dict[str, Union[int, float]]]:
-        """
-        O(N) bin assignment:
-          • single pass over interior elements
-          • assigns each element to a bin index by floor(t/bin_width)
-
-        Returns:
-          (series, telemetry)
-        """
-        if cs.coords is None or cs.T is None:
-            return ([], {"n_bins": n_bins, "used_exact": 0, "used_greedy": 0, "max_band": 0})
-
-        T = float(cs.T)
-        interior = cs.interior if cs.interior is not None else set(range(cs.n))
-        bin_width = T / n_bins
-
-        bins: List[Set[int]] = [set() for _ in range(n_bins)]
-
-        # O(N) fill
-        for e in interior:
-            coord = cs.coords.get(e)
-            if coord is None:
-                continue
-            t = float(coord[0])
-            if not (0.0 <= t <= T):
-                continue
-            idx = int(t / bin_width)
-            if idx == n_bins:
-                idx = n_bins - 1
-            bins[idx].add(e)
-
-        series: List[Tuple[float, int]] = []
-        used_exact = 0
-        used_greedy = 0
-        max_band = 0
-
-        for i, band in enumerate(bins):
-            if len(band) < 2:
-                continue
-            max_band = max(max_band, len(band))
-            t_lo = i * bin_width
-            t_hi = (i + 1) * bin_width
-            t_mid = 0.5 * (t_lo + t_hi)
-
-            if use_exact and len(band) <= exact_cutoff:
-                w = WidthComputer.compute_width(cs, band, use_links=False)
-                used_exact += 1
-            else:
-                w = WidthComputer.compute_width_greedy_multistart(cs, band, n_starts=24, seed=42)
-                used_greedy += 1
-
-            series.append((t_mid, w))
-
-        telemetry = {
-            "n_bins": n_bins,
-            "used_exact": used_exact,
-            "used_greedy": used_greedy,
-            "max_band": max_band,
-        }
-
-        if enable_logging:
-            print(f"[V3 coord] bins={n_bins} exact={used_exact} greedy={used_greedy} max_band={max_band} cutoff={exact_cutoff}")
-
-        return (series, telemetry)
-
-    # ---------- robust peak-based fit for coord-time ----------
-    @staticmethod
-    def fit_coord_expanding_only(
-        t_v: List[Tuple[float, int]],
-        min_points: int = 3,
-        r2_min: float = 0.0,  # set to e.g. 0.8 if you want strict acceptance
-        ignore_fraction_near_peak: float = 0.10,
-        t_min: float = 1e-9
-    ) -> Tuple[float, float, float, Dict[str, float]]:
-        """
-        Robust expanding-only fit:
-          • find peak V₃ (by value)
-          • fit only points up to a guard before peak (to avoid turnover)
-          • uses log-log linear regression
-
-        Returns:
-          (alpha, std_err, r2, meta)
-        """
-        valid = [(t, v) for t, v in t_v if t > t_min and v > 0]
-        if len(valid) < min_points:
-            return (np.nan, np.nan, np.nan, {"n_fit": 0, "t_peak": np.nan, "t_hi": np.nan})
-
-        t_peak, v_peak = max(valid, key=lambda tv: tv[1])
-
-        # guard before peak
-        t_hi = (1.0 - ignore_fraction_near_peak) * t_peak
-        fit_pts = [(t, v) for t, v in valid if t_min < t <= max(t_min, t_hi)]
-
-        # if that left too few points, allow up to peak
-        if len(fit_pts) < min_points:
-            fit_pts = [(t, v) for t, v in valid if t_min < t <= t_peak]
-
-        if len(fit_pts) < min_points:
-            return (np.nan, np.nan, np.nan, {"n_fit": len(fit_pts), "t_peak": t_peak, "t_hi": t_hi})
-
-        t_arr = np.array([t for t, _ in fit_pts], dtype=float)
-        v_arr = np.array([v for _, v in fit_pts], dtype=float)
-
-        slope, intercept, r_val, p_val, std_err = stats.linregress(np.log(t_arr), np.log(v_arr))
-        r2 = r_val ** 2
-
-        if r2 < r2_min:
-            return (np.nan, np.nan, r2, {"n_fit": len(fit_pts), "t_peak": t_peak, "t_hi": t_hi})
-
-        return (float(slope), float(std_err), float(r2), {"n_fit": len(fit_pts), "t_peak": float(t_peak), "t_hi": float(t_hi)})
-
-
-# =============================================================================
-# SECTION 4: POISSON SPRINKLINGS (STORE COORDS + TIPS)
-# =============================================================================
-
-class PoissonSprinkling:
-    def __init__(self, seed: Optional[int] = None):
-        self.rng = np.random.default_rng(seed)
-
-    def sprinkle_minkowski_2d(self, n_elements: int, add_tips: bool = True) -> CausalSet:
-        total_n = n_elements + (2 if add_tips else 0)
-        cs = CausalSet(total_n, "Sprinkled-Minkowski-2D")
-
-        # 2D diamond volume V=T^2/2 => choose T so density ~1
-        T = np.sqrt(2 * n_elements)
-        pts: List[Tuple[float, float]] = []
-
-        while len(pts) < n_elements:
-            t = self.rng.uniform(0, T)
-            r_t = min(t, T - t)
-            if self.rng.random() < r_t / (T / 2):
-                x = self.rng.uniform(-r_t, r_t)
-                pts.append((t, x))
-
-        points = np.array(pts[:n_elements], dtype=float)
-        time_order = np.argsort(points[:, 0])
-        offset = 1 if add_tips else 0
-
-        # Build timelike pairs (i<j) then filter to covers
-        timelike: List[Tuple[int, int]] = []
-        for idx_i, i in enumerate(time_order[:-1]):
-            t_i, x_i = points[i]
-            for j in time_order[idx_i + 1:]:
-                dt = points[j, 0] - t_i
-                dx = abs(points[j, 1] - x_i)
-                if dx < dt:
-                    timelike.append((i, j))
-
-        timelike_from = defaultdict(set)
-        for i, j in timelike:
-            timelike_from[i].add(j)
-
-        for i, j in timelike:
-            is_cover = True
-            for k in timelike_from[i]:
-                if k != j and j in timelike_from[k]:
-                    is_cover = False
-                    break
-            if is_cover:
-                cs.add_relation(i + offset, j + offset)
-
-        if add_tips:
-            cs.past_tip = 0
-            cs.future_tip = cs.n - 1
-            cs.interior = set(range(1, cs.n - 1))
-            for u in cs.interior:
-                cs.add_relation(cs.past_tip, u)
-                cs.add_relation(u, cs.future_tip)
-            cs.add_relation(cs.past_tip, cs.future_tip)
-
-        # Store coords + T (Patch 5)
-        cs.T = float(T)
-        cs.coords = {}
-        for idx, (t, x) in enumerate(points):
-            cs.coords[idx + offset] = (float(t), float(x))
-        if add_tips:
-            cs.coords[0] = (0.0, 0.0)
-            cs.coords[cs.n - 1] = (float(T), 0.0)
-
-        ensure_transitive_closure(cs)
-        return cs
-
-    def sprinkle_minkowski_4d(self, n_elements: int, add_tips: bool = True) -> CausalSet:
-        total_n = n_elements + (2 if add_tips else 0)
-        cs = CausalSet(total_n, "Sprinkled-Minkowski-4D")
-
-        # 4D diamond volume V = π T^4 / 24
-        T = (24 * n_elements / np.pi) ** 0.25
-        pts: List[Tuple[float, float, float, float]] = []
-
-        while len(pts) < n_elements:
-            t = self.rng.uniform(0, T)
-            r_t = min(t, T - t)
-            if self.rng.random() < (r_t / (T / 2)) ** 3:
-                theta = np.arccos(2 * self.rng.random() - 1)
-                phi = 2 * np.pi * self.rng.random()
-                r = r_t * (self.rng.random() ** (1 / 3))
-                x = r * np.sin(theta) * np.cos(phi)
-                y = r * np.sin(theta) * np.sin(phi)
-                z = r * np.cos(theta)
-                pts.append((t, x, y, z))
-
-        points = np.array(pts[:n_elements], dtype=float)
-        time_order = np.argsort(points[:, 0])
-        offset = 1 if add_tips else 0
-
-        timelike: List[Tuple[int, int]] = []
-        for idx_i, i in enumerate(time_order[:-1]):
-            t_i = points[i, 0]
-            xyz_i = points[i, 1:]
-            for j in time_order[idx_i + 1:]:
-                dt = points[j, 0] - t_i
-                dr2 = np.sum((points[j, 1:] - xyz_i) ** 2)
-                if dr2 < dt ** 2:
-                    timelike.append((i, j))
-
-        timelike_from = defaultdict(set)
-        for i, j in timelike:
-            timelike_from[i].add(j)
-
-        for i, j in timelike:
-            is_cover = True
-            for k in timelike_from[i]:
-                if k != j and j in timelike_from[k]:
-                    is_cover = False
-                    break
-            if is_cover:
-                cs.add_relation(i + offset, j + offset)
-
-        if add_tips:
-            cs.past_tip = 0
-            cs.future_tip = cs.n - 1
-            cs.interior = set(range(1, cs.n - 1))
-            for u in cs.interior:
-                cs.add_relation(cs.past_tip, u)
-                cs.add_relation(u, cs.future_tip)
-            cs.add_relation(cs.past_tip, cs.future_tip)
-
-        # Store coords + T (Patch 5)
-        cs.T = float(T)
-        cs.coords = {}
-        for idx, (t, x, y, z) in enumerate(points):
-            cs.coords[idx + offset] = (float(t), float(x), float(y), float(z))
-        if add_tips:
-            cs.coords[0] = (0.0, 0.0, 0.0, 0.0)
-            cs.coords[cs.n - 1] = (float(T), 0.0, 0.0, 0.0)
-
-        ensure_transitive_closure(cs)
-        return cs
-
-
-# =============================================================================
-# SECTION 5: GROWTH MODELS (NOT RS-CSG)
-# =============================================================================
-
-class GrowthModels:
-    def __init__(self, seed: Optional[int] = None):
-        self.rng = np.random.default_rng(seed)
-
-    def transitive_percolation(self, n_elements: int, p: float = 0.3) -> CausalSet:
-        cs = CausalSet(n_elements, f"TransitivePercolation-p{p}")
-        for i in range(n_elements):
-            for j in range(i + 1, n_elements):
-                if self.rng.random() < p:
-                    cs.add_relation(i, j)
-        # closure (without densifying links)
-        ensure_transitive_closure(cs)
-        return cs
-
-    def sequential_growth_simplified(self, n_elements: int, q: float = 0.4) -> CausalSet:
-        cs = CausalSet(n_elements, f"SequentialGrowth-q{q}")
-        for new in range(1, n_elements):
-            direct = {old for old in range(new) if self.rng.random() < q}
-            full = set()
-            stack = list(direct)
-            while stack:
-                x = stack.pop()
-                if x in full:
-                    continue
-                full.add(x)
-                for anc in cs.past[x]:
-                    if anc not in full:
-                        stack.append(anc)
-            for old in full:
-                cs.add_relation(old, new)
-        return cs
-
-
-# =============================================================================
-# SECTION 6: INTERVAL SAMPLING (LOG-BINNED)
-# =============================================================================
-
-class IntervalSampler:
-    def __init__(self, M: int = 400, K: int = 6, N_min: int = 8, N_max_fraction: float = 0.50, seed: Optional[int] = None):
-        self.M = M
-        self.K = K
-        self.N_min = N_min
-        self.N_max_fraction = N_max_fraction
-        self.rng = np.random.default_rng(seed)
-
-    def _do_sample(
-        self,
-        cs: CausalSet,
-        tau: Optional[Dict[int, int]],
-        effective_tau_gap: int,
-        N_max: int,
-        elements_with_future: List[int],
-        exclude: Set[int],
-    ) -> List[Tuple[int, int, int]]:
-        ratio = N_max / self.N_min if self.N_min > 0 else 1
-        K_eff = min(self.K, max(2, int(np.log(max(ratio, 1.1)) / np.log(1.6))))
-        bin_edges = np.exp(np.linspace(np.log(self.N_min), np.log(N_max), K_eff + 1))
-        per_bin = self.M // K_eff
-        bins: List[List[Tuple[int, int, int]]] = [[] for _ in range(K_eff)]
-
-        max_attempts = self.M * 150
-        attempts = 0
-        future_cache: Dict[int, List[int]] = {}
-
-        while attempts < max_attempts:
-            if all(len(b) >= per_bin for b in bins):
-                break
-
-            x = elements_with_future[self.rng.integers(len(elements_with_future))]
-            fut = future_cache.get(x)
-            if fut is None:
-                fut = [z for z in cs.future[x] if z not in exclude]
-                future_cache[x] = fut
-            if not fut:
-                attempts += 1
-                continue
-
-            z = None
-            for _ in range(20):
-                cand = fut[self.rng.integers(len(fut))]
-                if tau is None or effective_tau_gap == 0:
-                    z = cand
-                    break
-                if tau.get(cand, 0) - tau.get(x, 0) >= effective_tau_gap:
-                    z = cand
-                    break
-            if z is None:
-                attempts += 1
-                continue
-
-            interval = cs.interval(x, z)
-            size = len(interval)
-            if size < self.N_min or size > N_max:
-                attempts += 1
-                continue
-
-            bidx = None
-            for b in range(K_eff):
-                if bin_edges[b] <= size < bin_edges[b + 1]:
-                    bidx = b
-                    break
-            if bidx is None:
-                bidx = K_eff - 1
-
-            if len(bins[bidx]) < per_bin:
-                bins[bidx].append((x, z, size))
-
-            attempts += 1
-
-        out = []
-        for b in bins:
-            out.extend(b)
-        return out
-
-    def sample(
-        self,
-        cs: CausalSet,
-        tau: Optional[Dict[int, int]] = None,
-        tau_gap_min: Optional[int] = None,
-        tau_gap_fraction: float = 0.25,
-        exclude_elements: Optional[Set[int]] = None,
-    ) -> List[Tuple[int, int, int]]:
-        exclude = exclude_elements or set()
-        elements_with_future = [x for x in range(cs.n) if cs.future[x] and x not in exclude]
-        if not elements_with_future:
-            return []
-
-        N_max = max(self.N_min + 1, int(cs.n * self.N_max_fraction))
-
-        effective_tau_gap = 0
-        if tau is not None:
-            tau_max = max(tau.values()) if tau else 0
-            if tau_gap_min is not None:
-                effective_tau_gap = tau_gap_min
-            else:
-                raw = int(tau_gap_fraction * tau_max)
-                effective_tau_gap = max(2, min(raw, 15, int(0.5 * tau_max)))
-
-        ratio = N_max / self.N_min if self.N_min > 0 else 1
-        K_eff = min(self.K, max(2, int(np.log(max(ratio, 1.1)) / np.log(1.6))))
-        target = (self.M // K_eff) * K_eff
-
-        res = self._do_sample(cs, tau, effective_tau_gap, N_max, elements_with_future, exclude)
-
-        if len(res) < 0.6 * target and effective_tau_gap > 2:
-            effective_tau_gap = max(2, effective_tau_gap // 2)
-            res = self._do_sample(cs, tau, effective_tau_gap, N_max, elements_with_future, exclude)
-
-        if len(res) < 0.6 * target and effective_tau_gap > 0:
-            res = self._do_sample(cs, tau, 0, N_max, elements_with_future, exclude)
-
-        return res
-
-
-# =============================================================================
-# SECTION 7: MYRHEIM–MEYER
-# =============================================================================
-
-class MyrheimMeyer:
-    @staticmethod
-    def f_d(d: float) -> float:
-        return (gamma_func(d + 1) * gamma_func(d / 2)) / (4 * gamma_func(3 * d / 2))
-
-    @classmethod
-    def estimate_dimension(cls, chi: float) -> float:
-        if np.isnan(chi) or chi <= 0:
-            return np.nan
-        if chi >= cls.f_d(1.5):
-            return 1.5
-        if chi <= cls.f_d(10.0):
-            return 10.0
-        try:
-            return brentq(lambda d: cls.f_d(d) - chi, 1.5, 10.0)
-        except Exception:
-            return np.nan
-
-    @classmethod
-    def estimate_for_interval(cls, cs: CausalSet, x: int, z: int) -> Tuple[float, int, float]:
-        interval = cs.interval(x, z)
-        N = len(interval)
-        if N < 4:
-            return (np.nan, N, np.nan)
-        C2 = cs.count_relations_in_interval(interval)
-        chi = C2 / (N * (N - 1))
-        return (cls.estimate_dimension(chi), N, chi)
-
-
-# =============================================================================
-# SECTION 8: PROTOCOL A RUNNER
-# =============================================================================
+ActionType = Literal["knn_graph", "mst", "pair_dist"]
 
 @dataclass
-class ProtocolAResult:
-    cs_type: str
-    n_elements: int
-    n_relations: int
-
-    # V3 series: split into coord vs chain (hardening)
-    v3_coord: List[Tuple[float, int]] = field(default_factory=list)  # (t_mid, V3)
-    v3_chain: List[Tuple[int, int]] = field(default_factory=list)    # (tau, V3)
-
-    # Fitted alpha (from coord if available else chain)
-    alpha: float = np.nan
-    alpha_err: float = np.nan
-    alpha_r2: float = np.nan
-
-    # d_MM
-    d_mm_mean: float = np.nan
-    d_mm_std: float = np.nan
-    n_intervals: int = 0
-
-    # optional metadata
-    fit_meta: Dict[str, float] = field(default_factory=dict)
-    v3_telemetry: Dict[str, Union[int, float]] = field(default_factory=dict)
+class ToyProtocolCConfig:
+    num_configs: int = 4000             # total configs (half entropic, half sprinkled)
+    ambient_dim: int = 50               # D
+    intrinsic_dim: int = 5              # d_true for sprinkled-like
+    num_points: int = 120               # N points per cloud
+    sprinkled_noise: float = 0.10       # small ambient noise on sprinkled
+    betas: np.ndarray = field(default_factory=lambda: np.linspace(0.1, 10.0, 20))
 
 
-class ProtocolA:
-    def __init__(
-        self,
-        seed: int = 42,
-        delta: Optional[int] = None,
-        use_exact: bool = True,
-        exact_cutoff_chain: int = 3000,
-        exact_cutoff_coord: int = 6000,
-        coord_bins: int = 15,
-        enable_v3_logging: bool = False,
-    ):
-        self.sprinkling = PoissonSprinkling(seed)
-        self.growth = GrowthModels(seed)
-        self.sampler = IntervalSampler(M=400, K=6, N_max_fraction=0.50, seed=seed)
+    action_type: ActionType = "knn_graph"
+    action_knn_k: int = 8               # for knn_graph action
 
-        self.delta = delta
-        self.use_exact = use_exact
-        self.exact_cutoff_chain = exact_cutoff_chain
-        self.exact_cutoff_coord = exact_cutoff_coord
-        self.coord_bins = coord_bins
-        self.enable_v3_logging = enable_v3_logging
+    # Speed knobs
+    pair_samples_for_action: int = 4000 # used if action_type == "pair_dist"
+    twonn_subsample: int = 200          # number of points to use for TwoNN (<= N); set <=0 to use all
+    pca_dim_for_twonn: int = 0          # 0 disables PCA, else reduce to this many dims
+    twonn_trim_frac: float = 0.05       # 0 disables trimming; else trim extremes of log(mu)
 
-    def test_single(self, cs: CausalSet) -> ProtocolAResult:
-        # Intrinsic time (for MM sampling and for growth-model V3)
-        if cs.past_tip is not None and cs.interior is not None:
-            tau_full = V3Computer.compute_midpoint_time_for_diamond(cs)
-            tau = {x: tau_full[x] for x in cs.interior}
-            exclude = {cs.past_tip, cs.future_tip} if cs.future_tip is not None else {cs.past_tip}
-        else:
-            tau = V3Computer.compute_intrinsic_time(cs)
-            exclude = set()
+    # Sampling from Ω at each beta
+    num_weighted_samples: int = 800     # how many configs to sample from Boltzmann weights
 
-        # V3: populate BOTH fields (hardening)
-        v3_coord: List[Tuple[float, int]] = []
-        v3_chain: List[Tuple[int, int]] = []
-        alpha = np.nan
-        alpha_err = np.nan
-        alpha_r2 = np.nan
-        fit_meta: Dict[str, float] = {}
-        v3_telemetry: Dict[str, Union[int, float]] = {}
+    # Metropolis ruggedness probe
+    metro_steps: int = 300              # per beta
+    local_move_sigma: float = 0.02      # perturbation strength for local moves
+    metro_measure_every: int = 1        # measure each step (keep 1)
 
-        # Coordinate-time V3 only for sprinklings with coords
-        if cs.coords is not None and cs.T is not None:
-            v3_coord, v3_telemetry = V3Computer.compute_V3_coordinate_time(
-                cs,
-                n_bins=self.coord_bins,
-                use_exact=self.use_exact,
-                exact_cutoff=self.exact_cutoff_coord,
-                enable_logging=self.enable_v3_logging,
-            )
-            alpha, alpha_err, alpha_r2, meta = V3Computer.fit_coord_expanding_only(v3_coord)
-            fit_meta = {k: float(v) for k, v in meta.items()}
-        else:
-            # Chain-time V3 for growth models
-            v3_chain = V3Computer.compute_V3_thickened_chain_time(
-                cs,
-                tau,
-                delta=self.delta,
-                use_exact=self.use_exact,
-                exact_cutoff=self.exact_cutoff_chain,
-            )
-            # basic expanding-only heuristic: fit up to peak
-            valid = [(t, v) for t, v in v3_chain if t > 0 and v > 0]
-            if len(valid) >= 3:
-                t_peak, _ = max(valid, key=lambda tv: tv[1])
-                fit_pts = [(t, v) for t, v in valid if 0 < t <= t_peak]
-                if len(fit_pts) >= 3:
-                    t_arr = np.array([t for t, _ in fit_pts], dtype=float)
-                    v_arr = np.array([v for _, v in fit_pts], dtype=float)
-                    slope, intercept, r_val, p_val, std_err = stats.linregress(np.log(t_arr), np.log(v_arr))
-                    alpha, alpha_err, alpha_r2 = float(slope), float(std_err), float(r_val ** 2)
-                    fit_meta = {"n_fit": float(len(fit_pts)), "t_peak": float(t_peak), "t_hi": float(t_peak)}
+    seed: int = 42
 
-        # Myrheim–Meyer intervals (always intrinsic)
-        intervals = self.sampler.sample(cs, tau=tau, exclude_elements=exclude)
-        d_vals = []
-        for x, z, _ in intervals:
-            d, N, chi = MyrheimMeyer.estimate_for_interval(cs, x, z)
-            if not np.isnan(d):
-                d_vals.append(d)
 
-        d_mean = float(np.mean(d_vals)) if d_vals else np.nan
-        d_std = float(np.std(d_vals)) if d_vals else np.nan
+# ----------------------------
+# Ensemble generators
+# ----------------------------
 
-        return ProtocolAResult(
-            cs_type=cs.label,
-            n_elements=cs.n,
-            n_relations=cs.n_relations(),
-            v3_coord=v3_coord,
-            v3_chain=v3_chain,
-            alpha=alpha,
-            alpha_err=alpha_err,
-            alpha_r2=alpha_r2,
-            d_mm_mean=d_mean,
-            d_mm_std=d_std,
-            n_intervals=len(d_vals),
-            fit_meta=fit_meta,
-            v3_telemetry=v3_telemetry,
+def generate_entropic_cloud(rng: np.random.Generator, n: int, d: int) -> np.ndarray:
+    return rng.standard_normal((n, d))
+
+def generate_sprinkled_cloud(
+    rng: np.random.Generator,
+    n: int,
+    ambient_d: int,
+    intrinsic_d: int,
+    noise: float
+) -> np.ndarray:
+    # Sample in intrinsic space
+    low = rng.standard_normal((n, intrinsic_d))
+    # Random linear embedding into ambient space
+    proj = rng.standard_normal((ambient_d, intrinsic_d))
+    embedded = low @ proj.T
+    return embedded + noise * rng.standard_normal((n, ambient_d))
+
+
+# ----------------------------
+# Preprocessing: scale normalization (critical!)
+# ----------------------------
+
+def normalize_cloud(C: np.ndarray) -> np.ndarray:
+    """
+    Remove translation and normalize RMS radius to 1.
+
+    This kills the trivial effect where exp(-β S) just picks smaller-variance clouds.
+    """
+    # Be defensive: if clouds are stored in a dtype=object container (as we do for Ω),
+    # individual clouds can arrive as object-typed arrays, which will break linear algebra.
+    try:
+        C = np.asarray(C, dtype=np.float64)
+    except Exception as e:  # noqa: BLE001
+        raise TypeError(
+            "normalize_cloud expected a numeric (N,D) array-like cloud; "
+            f"got type={type(C)!r}."
+        ) from e
+    if C.ndim != 2:
+        raise ValueError(f"normalize_cloud expected a 2D array (N,D); got shape={C.shape!r}")
+
+    X = C - C.mean(axis=0, keepdims=True)
+    rms = np.sqrt(np.mean(np.sum(X * X, axis=1)))
+    if rms < 1e-12:
+        return X
+    return X / rms
+
+
+# ----------------------------
+# Utilities: distances without full NxN when possible
+# ----------------------------
+
+def sample_pairwise_distances(
+    rng: np.random.Generator, X: np.ndarray, n_pairs: int
+) -> np.ndarray:
+    n = X.shape[0]
+    i = rng.integers(0, n, size=n_pairs)
+    j = rng.integers(0, n, size=n_pairs)
+    # ensure i != j for most pairs
+    mask = (i == j)
+    if np.any(mask):
+        j[mask] = (j[mask] + 1) % n
+    diff = X[i] - X[j]
+    # Return squared distances.
+    # For centered data, E||xi-xj||^2 = 2 E||x||^2, so after RMS-radius normalization this
+    # is ~2 for *any* cloud geometry (good negative-control action).
+    return np.sum(diff * diff, axis=1)
+
+def full_distance_matrix(X):
+    X = np.asarray(X, dtype=np.float64)
+    diff = X[:, None, :] - X[None, :, :]
+    return np.sqrt(np.sum(diff * diff, axis=-1))
+
+
+
+# ----------------------------
+# Action definitions (scale-invariant)
+# ----------------------------
+
+def action_pair_dist(
+    rng: np.random.Generator, X: np.ndarray, n_pairs: int
+) -> float:
+    # After normalize_cloud (RMS radius = 1), mean squared pair distance is ~2 regardless of
+    # intrinsic structure. This is a good "wrong action" control.
+    d2 = sample_pairwise_distances(rng, X, n_pairs)
+    return float(np.mean(d2))
+
+def action_knn_graph(
+    X: np.ndarray, k: int
+) -> float:
+    """
+    Mean kNN edge length (excluding self).
+    Uses full NxN distances for simplicity; for N~120 it's fine.
+    """
+    D = full_distance_matrix(X)
+    np.fill_diagonal(D, np.inf)
+    # k nearest distances per point
+    knn = np.partition(D, kth=k-1, axis=1)[:, :k]
+    return float(np.mean(knn))
+
+def action_mst_mean_edge(
+    X: np.ndarray
+) -> float:
+    """
+    Mean edge length of MST using dense Prim (O(N^2)).
+    For N ~ 100-200, fine. Uses full distances.
+    """
+    D = full_distance_matrix(X)
+    n = D.shape[0]
+    in_mst = np.zeros(n, dtype=bool)
+    min_edge = np.full(n, np.inf)
+    min_edge[0] = 0.0
+    total = 0.0
+    edges = 0
+
+    for _ in range(n):
+        u = int(np.argmin(np.where(in_mst, np.inf, min_edge)))
+        in_mst[u] = True
+        if min_edge[u] != 0.0 and np.isfinite(min_edge[u]):
+            total += float(min_edge[u])
+            edges += 1
+        # relax
+        du = D[u]
+        min_edge = np.minimum(min_edge, du)
+
+    if edges == 0:
+        return 0.0
+    return total / edges
+
+
+def compute_action(
+    rng: np.random.Generator,
+    cloud: np.ndarray,
+    action_type: ActionType,
+    knn_k: int,
+    pair_samples: int
+) -> float:
+    X = normalize_cloud(cloud)
+    if action_type == "pair_dist":
+        return action_pair_dist(rng, X, pair_samples)
+    if action_type == "knn_graph":
+        return action_knn_graph(X, knn_k)
+    if action_type == "mst":
+        return action_mst_mean_edge(X)
+    raise ValueError(f"Unknown action_type: {action_type}")
+
+
+# ----------------------------
+# TwoNN intrinsic dimension estimator (robust-ish)
+# ----------------------------
+
+def pca_reduce(X: np.ndarray, out_dim: int) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"pca_reduce expected a 2D array (N,D); got shape={X.shape!r}")
+    if out_dim <= 0 or out_dim >= X.shape[1]:
+        return X
+    # SVD on centered data
+    Y = X - X.mean(axis=0, keepdims=True)
+    U, S, Vt = np.linalg.svd(Y, full_matrices=False)
+    return Y @ Vt[:out_dim].T
+
+def estimate_intrinsic_dim_twonn(
+    rng: np.random.Generator,
+    cloud: np.ndarray,
+    subsample: int = 0,
+    pca_dim: int = 0,
+    trim_frac: float = 0.05
+) -> float:
+    """
+    TwoNN estimator:
+      d ≈ 1 / mean(log(mu))   (one common variant)
+    Your previous variant used -2/mean(log(mu)). Variants exist; scaling differs.
+
+    We:
+      - normalize cloud
+      - optionally subsample points
+      - optionally PCA-reduce
+      - compute full NxN distances for the subsample
+      - trim extremes of log(mu) for stability
+    """
+    X = normalize_cloud(cloud)
+    n = X.shape[0]
+    if subsample and 0 < subsample < n:
+        idx = rng.choice(n, size=subsample, replace=False)
+        X = X[idx]
+
+    X = pca_reduce(X, pca_dim)
+
+    D = full_distance_matrix(X)
+    np.fill_diagonal(D, np.inf)
+    nn = np.partition(D, kth=1, axis=1)[:, :2]  # two nearest distances
+    d1 = nn[:, 0]
+    d2 = nn[:, 1]
+    # avoid zeros / degeneracy
+    d1 = np.maximum(d1, 1e-12)
+    mu = d2 / d1
+    logmu = np.log(np.maximum(mu, 1.0 + 1e-12))
+
+    # trim outliers
+    if 0.0 < trim_frac < 0.5:
+        lo = np.quantile(logmu, trim_frac)
+        hi = np.quantile(logmu, 1.0 - trim_frac)
+        logmu = logmu[(logmu >= lo) & (logmu <= hi)]
+        if logmu.size == 0:
+            return np.nan
+
+    m = float(np.mean(logmu))
+    if m <= 1e-12:
+        return np.nan
+    return float(1.0 / m)
+
+
+# ----------------------------
+# Boltzmann sampling over a fixed Ω
+# ----------------------------
+
+def softmax_logweights(logw: np.ndarray) -> np.ndarray:
+    a = logw - np.max(logw)
+    w = np.exp(a)
+    s = np.sum(w)
+    return w / s if s > 0 else np.full_like(w, 1.0 / len(w))
+
+
+# ----------------------------
+# Metropolis ruggedness probe (local move on clouds)
+# ----------------------------
+
+def metropolis_ruggedness_probe(
+    rng: np.random.Generator,
+    clouds: np.ndarray,
+    actions: np.ndarray,
+    beta: float,
+    action_type: ActionType,
+    knn_k: int,
+    pair_samples: int,
+    steps: int,
+    sigma: float
+) -> Tuple[float, float]:
+    """
+    Pick a random cloud from Ω and do local Gaussian perturbations:
+      C' = C + sigma * N(0,1)
+    Accept with Metropolis prob exp(-β (S' - S)).
+
+    Returns:
+      (accept_rate, var_deltaS)
+    """
+    idx = int(rng.integers(0, len(clouds)))
+    C = clouds[idx].copy()
+    S = float(actions[idx])
+
+    accepted = 0
+    deltaS_list: List[float] = []
+
+    for _ in range(steps):
+        Cp = C + sigma * rng.standard_normal(C.shape)
+        Sp = compute_action(rng, Cp, action_type, knn_k, pair_samples)
+        dS = Sp - S
+        deltaS_list.append(dS)
+
+        if dS <= 0 or rng.random() < np.exp(-beta * dS):
+            C = Cp
+            S = Sp
+            accepted += 1
+
+    return accepted / max(steps, 1), float(np.var(deltaS_list)) if deltaS_list else np.nan
+
+
+# ----------------------------
+# Main experiment
+# ----------------------------
+
+def run_toy_protocol_c(
+    cfg: ToyProtocolCConfig,
+    *,
+    do_metropolis: bool = True,
+    report_twonn_baseline_by_label: bool = False,
+    twonn_baseline_samples_per_label: int = 100,
+):
+    rng = np.random.default_rng(cfg.seed)
+
+    n_ent = cfg.num_configs // 2
+    n_spr = cfg.num_configs - n_ent
+
+    # Build Ω and labels
+    clouds = []
+    labels = []  # 0 entropic, 1 sprinkled
+    for _ in range(n_ent):
+        clouds.append(generate_entropic_cloud(rng, cfg.num_points, cfg.ambient_dim))
+        labels.append(0)
+    for _ in range(n_spr):
+        clouds.append(generate_sprinkled_cloud(rng, cfg.num_points, cfg.ambient_dim, cfg.intrinsic_dim, cfg.sprinkled_noise))
+        labels.append(1)
+
+    # Shapes are fixed here, so prefer a dense numeric array for speed + safety.
+    # Result shape: (M, N, D)
+    clouds = np.stack(clouds, axis=0).astype(np.float64, copy=False)
+    labels = np.array(labels, dtype=int)
+
+    # Precompute actions S(C) on Ω (most expensive part)
+    S_vals = np.empty(cfg.num_configs, dtype=float)
+    for i in range(cfg.num_configs):
+        S_vals[i] = compute_action(
+            rng, clouds[i], cfg.action_type, cfg.action_knn_k, cfg.pair_samples_for_action
         )
 
-    def run_full_protocol(self, sizes: List[int], n_realizations: int) -> Dict[str, List[ProtocolAResult]]:
-        out: Dict[str, List[ProtocolAResult]] = {
-            "minkowski_2d": [],
-            "minkowski_4d": [],
-            "trans_percolation_03": [],
-            "sequential_growth_04": [],
+    # Baseline: compare S distributions by label
+    S_ent = S_vals[labels == 0]
+    S_spr = S_vals[labels == 1]
+
+    # Informativeness check: correlation between action and true labels.
+    # labels are {0=entropic, 1=sprinkled}. A strongly *negative* correlation means
+    # sprinkled configs tend to have lower S (desired for Protocol C mechanism).
+    if np.std(S_vals) < 1e-15 or np.std(labels) < 1e-15:
+        corr_S_label = np.nan
+    else:
+        corr_S_label = float(np.corrcoef(S_vals, labels)[0, 1])
+
+    baseline = {
+        "S_ent_mean": float(np.mean(S_ent)),
+        "S_spr_mean": float(np.mean(S_spr)),
+        "S_ent_std": float(np.std(S_ent)),
+        "S_spr_std": float(np.std(S_spr)),
+        "corr_S_label": corr_S_label,
+    }
+
+    twonn_baseline = None
+    if report_twonn_baseline_by_label:
+        # Use a dedicated RNG so baseline reporting doesn't perturb the main run's RNG stream.
+        rng_twonn_base = np.random.default_rng(cfg.seed + 12345)
+
+        def _twonn_summary_for_indices(idxs: np.ndarray) -> Tuple[float, float, int]:
+            if idxs.size == 0:
+                return (np.nan, np.nan, 0)
+            k = int(min(max(twonn_baseline_samples_per_label, 0), idxs.size))
+            if k <= 0:
+                return (np.nan, np.nan, 0)
+            chosen = rng_twonn_base.choice(idxs, size=k, replace=False)
+            vals: List[float] = []
+            for j in chosen:
+                d_hat = estimate_intrinsic_dim_twonn(
+                    rng_twonn_base,
+                    clouds[int(j)],
+                    subsample=cfg.twonn_subsample,
+                    pca_dim=cfg.pca_dim_for_twonn,
+                    trim_frac=cfg.twonn_trim_frac,
+                )
+                if np.isfinite(d_hat):
+                    vals.append(float(d_hat))
+            if not vals:
+                return (np.nan, np.nan, 0)
+            arr = np.array(vals, dtype=np.float64)
+            return (float(np.mean(arr)), float(np.std(arr)), int(arr.size))
+
+        ent_idxs = np.where(labels == 0)[0]
+        spr_idxs = np.where(labels == 1)[0]
+        ent_mean, ent_std, ent_n = _twonn_summary_for_indices(ent_idxs)
+        spr_mean, spr_std, spr_n = _twonn_summary_for_indices(spr_idxs)
+        twonn_baseline = {
+            "id_ent_mean": ent_mean,
+            "id_ent_std": ent_std,
+            "id_ent_n": ent_n,
+            "id_spr_mean": spr_mean,
+            "id_spr_std": spr_std,
+            "id_spr_n": spr_n,
+            "samples_per_label": int(twonn_baseline_samples_per_label),
+            "twonn_subsample": int(cfg.twonn_subsample),
+            "pca_dim": int(cfg.pca_dim_for_twonn),
+            "trim_frac": float(cfg.twonn_trim_frac),
         }
 
-        total = len(sizes) * n_realizations
-        cur = 0
+    # Diagnostics vs β
+    mean_id = []
+    std_id = []
+    p_sprinkled = []
+    mean_S = []
+    std_S = []
+    accept_rate = []
+    var_deltaS = []
 
-        for N in sizes:
-            for r in range(n_realizations):
-                cur += 1
-                print(f"[{cur}/{total}] N={N} realization {r+1}/{n_realizations}")
+    for beta in cfg.betas:
+        logw = -beta * S_vals
+        w = softmax_logweights(logw)
 
-                out["minkowski_2d"].append(self.test_single(self.sprinkling.sprinkle_minkowski_2d(N)))
-                out["minkowski_4d"].append(self.test_single(self.sprinkling.sprinkle_minkowski_4d(N)))
-                out["trans_percolation_03"].append(self.test_single(self.growth.transitive_percolation(N, p=0.3)))
-                out["sequential_growth_04"].append(self.test_single(self.growth.sequential_growth_simplified(N, q=0.4)))
+        # Sample indices from Ω by Boltzmann weights
+        idxs = rng.choice(cfg.num_configs, size=cfg.num_weighted_samples, replace=True, p=w)
+        sampled_clouds = clouds[idxs]
+        sampled_S = S_vals[idxs]
+        sampled_labels = labels[idxs]
 
-        return out
+        mean_S.append(float(np.mean(sampled_S)))
+        std_S.append(float(np.std(sampled_S)))
+        p_sprinkled.append(float(np.mean(sampled_labels == 1)))
 
-    @staticmethod
-    def evaluate(results: Dict[str, List[ProtocolAResult]]) -> Dict[str, Dict[str, Optional[float]]]:
-        evald: Dict[str, Dict[str, Optional[float]]] = {}
-        for key, lst in results.items():
-            if not lst:
-                continue
-            alphas = [r.alpha for r in lst if not np.isnan(r.alpha)]
-            dms = [r.d_mm_mean for r in lst if not np.isnan(r.d_mm_mean)]
-            evald[key] = {
-                "n_tests": float(len(lst)),
-                "alpha_mean": float(np.mean(alphas)) if alphas else None,
-                "alpha_std": float(np.std(alphas)) if alphas else None,
-                "d_mm_mean": float(np.mean(dms)) if dms else None,
-                "d_mm_std": float(np.std(dms)) if dms else None,
-            }
-        return evald
+        # TwoNN intrinsic dim (subsample + optional PCA)
+        ids = []
+        for C in sampled_clouds:
+            d_hat = estimate_intrinsic_dim_twonn(
+                rng,
+                C,
+                subsample=cfg.twonn_subsample,
+                pca_dim=cfg.pca_dim_for_twonn,
+                trim_frac=cfg.twonn_trim_frac,
+            )
+            if np.isfinite(d_hat):
+                ids.append(d_hat)
+        if ids:
+            mean_id.append(float(np.mean(ids)))
+            std_id.append(float(np.std(ids)))
+        else:
+            mean_id.append(np.nan)
+            std_id.append(np.nan)
 
+        if do_metropolis and cfg.metro_steps > 0:
+            # Ruggedness probe by Metropolis local moves
+            acc, vds = metropolis_ruggedness_probe(
+                rng,
+                clouds=clouds,
+                actions=S_vals,
+                beta=float(beta),
+                action_type=cfg.action_type,
+                knn_k=cfg.action_knn_k,
+                pair_samples=cfg.pair_samples_for_action,
+                steps=cfg.metro_steps,
+                sigma=cfg.local_move_sigma
+            )
+            accept_rate.append(acc)
+            var_deltaS.append(vds)
+        else:
+            accept_rate.append(np.nan)
+            var_deltaS.append(np.nan)
 
-# =============================================================================
-# SECTION 9: VISUALIZATION + REPORT
-# =============================================================================
-
-def create_visualization(results: Dict[str, List[ProtocolAResult]], evaluation: Dict[str, Dict[str, Optional[float]]], outpath: str):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-
-    colors = {
-        "minkowski_2d": "#27ae60",
-        "minkowski_4d": "#2ecc71",
-        "trans_percolation_03": "#e74c3c",
-        "sequential_growth_04": "#3498db",
+    results = {
+        "baseline": baseline,
+        "twonn_baseline": twonn_baseline,
+        "betas": cfg.betas,
+        "mean_id": np.array(mean_id),
+        "std_id": np.array(std_id),
+        # TwoNN prefactor ambiguity: some conventions use d_hat = 2/<log(mu)> instead of 1/<log(mu)>.
+        # This rescales estimates by 2× (including the spread) without changing the trend vs beta.
+        "mean_id_x2": 2.0 * np.array(mean_id),
+        "std_id_x2": 2.0 * np.array(std_id),
+        "p_sprinkled": np.array(p_sprinkled),
+        "mean_S": np.array(mean_S),
+        "std_S": np.array(std_S),
+        "accept_rate": np.array(accept_rate),
+        "var_deltaS": np.array(var_deltaS),
     }
-    labels = {
-        "minkowski_2d": "Minkowski 2D",
-        "minkowski_4d": "Minkowski 4D",
-        "trans_percolation_03": "Trans. Percolation",
-        "sequential_growth_04": "Seq. Growth",
-    }
+    return results
 
-    # Panel 1: d_MM histogram
-    ax = axes[0, 0]
-    for key, lst in results.items():
-        vals = [r.d_mm_mean for r in lst if not np.isnan(r.d_mm_mean)]
-        if vals:
-            ax.hist(vals, bins=8, alpha=0.5, label=labels.get(key, key), color=colors.get(key, "gray"))
-    ax.axvline(2.0, linestyle=":", linewidth=2)
-    ax.axvline(4.0, linestyle="--", linewidth=2)
-    ax.set_title("Myrheim–Meyer Dimension (intrinsic)")
-    ax.set_xlabel("d_MM")
-    ax.set_ylabel("count")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
 
-    # Panel 2: alpha means
-    ax = axes[0, 1]
-    keys = list(results.keys())
-    x = np.arange(len(keys))
-    means = []
-    xlabels = []
-    for k in keys:
-        e = evaluation.get(k, {})
-        means.append(e.get("alpha_mean") or 0.0)
-        xlabels.append(labels.get(k, k)[:12])
-    ax.bar(x, means, color=[colors.get(k, "gray") for k in keys], alpha=0.8)
-    ax.axhline(1.0, linestyle=":", alpha=0.7, linewidth=2, label="target α=1")
-    ax.axhline(3.0, linestyle="--", alpha=0.7, linewidth=2, label="target α=3")
-    ax.set_xticks(x)
-    ax.set_xticklabels(xlabels, rotation=45, ha="right")
-    ax.set_ylabel("α")
-    ax.set_title("Volume scaling exponent α")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis="y")
+def plot_results(cfg: ToyProtocolCConfig, results):
+    betas = results["betas"]
 
-    # Panel 3: Example V3 vs coordinate time (Minkowski) OR chain time (growth)
-    ax = axes[1, 0]
+    plt.figure(figsize=(16, 10))
 
-    # Prefer to show Minkowski coord-time if present
-    shown = False
-    for key in ["minkowski_4d", "minkowski_2d"]:
-        if results.get(key):
-            r0 = results[key][0]
-            if r0.v3_coord:
-                t = [tt for tt, vv in r0.v3_coord if tt > 0 and vv > 0]
-                v = [vv for tt, vv in r0.v3_coord if tt > 0 and vv > 0]
-                if t and v:
-                    ax.loglog(t, v, "o-", label=f"{labels.get(key, key)} (coord time t)", color=colors.get(key, "gray"))
-                    shown = True
+    # 1) Manifoldness drift (TwoNN)
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.errorbar(betas, results["mean_id"], yerr=results["std_id"], marker="o")
+    ax1.axhline(cfg.intrinsic_dim, linestyle="--", label=f"true intrinsic dim={cfg.intrinsic_dim}")
+    ax1.set_xlabel(r"$\beta$")
+    ax1.set_ylabel("Estimated intrinsic dimension (TwoNN)")
+    ax1.set_title("Manifoldness drift")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
 
-    if shown:
-        t_ref = np.linspace(1e-2, 1.0, 200)
-        # just reference shapes; scale arbitrary
-        ax.loglog(t_ref, t_ref**1, "k:", alpha=0.7, linewidth=2, label="t^(1)")
-        ax.loglog(t_ref, t_ref**3, "k--", alpha=0.7, linewidth=2, label="t^(3)")
-        ax.set_xlabel("coordinate time t")
-        ax.set_title("V₃(t) for Minkowski sprinklings (coordinate-time bands)")
-    else:
-        # fallback: show chain-time example
-        for key in ["trans_percolation_03", "sequential_growth_04"]:
-            if results.get(key):
-                r0 = results[key][0]
-                if r0.v3_chain:
-                    t = [tt for tt, vv in r0.v3_chain if tt > 0 and vv > 0]
-                    v = [vv for tt, vv in r0.v3_chain if tt > 0 and vv > 0]
-                    if t and v:
-                        ax.loglog(t, v, "o-", label=f"{labels.get(key, key)} (chain time τ)", color=colors.get(key, "gray"))
-        ax.set_xlabel("intrinsic chain time τ")
-        ax.set_title("V₃(τ) for growth models (intrinsic)")
+    # 2) Prevalence of sprinkled configs
+    ax2 = plt.subplot(2, 2, 2)
+    ax2.plot(betas, results["p_sprinkled"], marker="o")
+    ax2.axhline(0.5, linestyle="--", alpha=0.6, label="Ω baseline (50%)")
+    ax2.set_xlabel(r"$\beta$")
+    ax2.set_ylabel("P(sprinkled | β)")
+    ax2.set_title("Prevalence shift (true labels)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
 
-    ax.set_ylabel("V₃ (width)")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    # 3) Mean action under weighting
+    ax3 = plt.subplot(2, 2, 3)
+    ax3.errorbar(betas, results["mean_S"], yerr=results["std_S"], marker="s")
+    ax3.set_xlabel(r"$\beta$")
+    ax3.set_ylabel("⟨S⟩ under Boltzmann sampling")
+    ax3.set_title(f"Action vs β   (action={cfg.action_type})")
+    ax3.grid(True, alpha=0.3)
 
-    # Panel 4: summary table
-    ax = axes[1, 1]
-    ax.axis("off")
+    # 4) Ruggedness / landscape probe
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.plot(betas, results["accept_rate"], marker="o", label="Metropolis acceptance rate")
+    ax4b = ax4.twinx()
+    ax4b.plot(betas, results["var_deltaS"], marker="s", linestyle="--", label="Var(ΔS) under local moves")
+    ax4.set_xlabel(r"$\beta$")
+    ax4.set_ylabel("Acceptance rate")
+    ax4b.set_ylabel("Var(ΔS)")
 
-    table_data = []
-    for k in keys:
-        e = evaluation.get(k)
-        if not e:
-            continue
-        table_data.append([
-            labels.get(k, k)[:14],
-            f"{e['d_mm_mean']:.2f}" if e.get("d_mm_mean") is not None else "N/A",
-            f"{e['alpha_mean']:.2f}" if e.get("alpha_mean") is not None else "N/A",
-        ])
+    ax4.set_title("Landscape probe")
+    ax4.grid(True, alpha=0.3)
 
-    table = ax.table(
-        cellText=table_data,
-        colLabels=["Type", "d_MM", "α"],
-        cellLoc="center",
-        loc="center"
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.2, 1.8)
+    # joint legend
+    lines1, labels1 = ax4.get_legend_handles_labels()
+    lines2, labels2 = ax4b.get_legend_handles_labels()
+    ax4.legend(lines1 + lines2, labels1 + labels2, loc="best")
 
-    ax.set_title("Summary", fontsize=12, pad=20)
-
-    plt.suptitle("Protocol A – Final Hardened Implementation", fontsize=14, y=1.02)
     plt.tight_layout()
-    plt.savefig(outpath, dpi=150, bbox_inches="tight")
-    plt.close()
+    backend = matplotlib.get_backend()
+    if "agg" in backend.lower():
+        out_path = "protocol_c_results.png"
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        print(f"Saved plot to {out_path} (matplotlib backend: {backend})")
+        plt.close()
+    else:
+        plt.show()
 
 
-def generate_report(evaluation: Dict[str, Dict[str, Optional[float]]], delta: Optional[int]) -> str:
-    delta_str = "adaptive" if (delta is None or delta <= 0) else str(delta)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Toy Protocol C: Boltzmann-weighted selection toward structured point clouds"
+    )
+    parser.add_argument(
+        "--action-type",
+        choices=["knn_graph", "mst", "pair_dist"],
+        default=None,
+        help="Which action S(C) to use. Use 'pair_dist' as a negative control (after normalization it is ~constant).",
+    )
+    parser.add_argument(
+        "--sanity-twonn",
+        action="store_true",
+        help="Run a quick TwoNN honesty check: disables PCA (pca_dim=0), disables trimming (trim=0), "
+             "skips Metropolis probe, and suppresses plotting.",
+    )
+    parser.add_argument(
+        "--twonn-baseline-n",
+        type=int,
+        default=100,
+        help="Number of Ω configs per label for the unweighted TwoNN baseline summary (used in --sanity-twonn).",
+    )
+    args = parser.parse_args()
 
-    lines = []
-    lines.append("=" * 78)
-    lines.append("PROTOCOL A – FINAL HARDENED VERSION")
-    lines.append("=" * 78)
-    lines.append("")
-    lines.append("CORE CORRECTNESS:")
-    lines.append("  • width via Dilworth on FULL closure (never links)")
-    lines.append("  • d_MM always intrinsic (order-only)")
-    lines.append("")
-    lines.append("PATCH 5 (BREAKTHROUGH):")
-    lines.append("  • Minkowski sprinklings store coordinates and use coordinate-time t-bands")
-    lines.append("  • α is fit on the expanding branch using robust peak-based cutoff")
-    lines.append("")
-    lines.append("INTERPRETATION:")
-    lines.append("  • For sprinklings: α measures continuum spatial volume scaling (extrinsic axis).")
-    lines.append("  • For growth models: α~0 under intrinsic time is a useful model fingerprint.")
-    lines.append("")
-    lines.append("TARGETS:")
-    lines.append("  • 2D Minkowski: d_MM≈2, α≈1")
-    lines.append("  • 4D Minkowski: d_MM≈4, α≈3")
-    lines.append("")
-    lines.append("-" * 78)
+    cfg = ToyProtocolCConfig(
+        num_configs=4000,
+        ambient_dim=50,
+        intrinsic_dim=5,
+        num_points=120,
+        sprinkled_noise=0.10,
+        betas=np.linspace(0.1, 10.0, 20),
 
-    for key, e in evaluation.items():
-        lines.append(f"\n{key.upper()}:")
-        lines.append(f"  Tests: {int(e['n_tests'])}")
-        if e.get("d_mm_mean") is not None:
-            lines.append(f"  d_MM: {e['d_mm_mean']:.2f} ± {e['d_mm_std']:.2f}")
-        if e.get("alpha_mean") is not None:
-            lines.append(f"  α: {e['alpha_mean']:.2f} ± {e['alpha_std']:.2f}")
+        # Try "knn_graph" first; it's meaningfully geometry-sensitive after normalization.
+        action_type="knn_graph",
+        action_knn_k=8,
 
-    # Validation cross-check paragraph (hardening)
-    lines.append("\n" + "-" * 78)
-    lines.append("VALIDATION CROSS-CHECK:")
-    lines.append("  • Minkowski sprinklings: α should track (d−1) when using coordinate-time t-bands.")
-    lines.append("    This is observed (within finite-size noise), while d_MM remains intrinsic and stable.")
-    lines.append("  • If you switch Minkowski α back to intrinsic chain-time bands, α degrades due to")
-    lines.append("    discreteness/foliation effects—confirming the role of the time axis in V₃ extraction.")
-    lines.append("")
-    lines.append("=" * 78)
-    return "\n".join(lines)
+        # TwoNN settings
+        twonn_subsample=120,       # use all points (N=120)
+        pca_dim_for_twonn=15,      # helps TwoNN in high ambient dim; set 0 to disable
 
+        # Sampling
+        num_weighted_samples=800,
 
-# =============================================================================
-# SECTION 10: MAIN
-# =============================================================================
+        # Metropolis probe
+        metro_steps=300,
+        local_move_sigma=0.02,
 
-def main(sizes=None, n_realizations=2, seed=42, delta=0, use_exact=True):
-    if sizes is None:
-        sizes = [500, 1000]
-
-    if not WidthComputer.verify_dilworth():
-        raise RuntimeError("Dilworth sanity checks failed.")
-
-    effective_delta = None if delta <= 0 else delta
-
-    protocol = ProtocolA(
-        seed=seed,
-        delta=effective_delta,
-        use_exact=use_exact,
-        exact_cutoff_chain=3000,
-        exact_cutoff_coord=6000,
-        coord_bins=15,
-        enable_v3_logging=False,  # set True if you want telemetry printed
+        seed=42,
     )
 
-    results = protocol.run_full_protocol(sizes, n_realizations)
-    evaluation = protocol.evaluate(results)
+    if args.action_type is not None:
+        cfg = replace(cfg, action_type=args.action_type)
 
-    report = generate_report(evaluation, effective_delta)
-    with open("protocol_a_final_report.txt", "w") as f:
-        f.write(report)
+    do_plot = True
+    do_metropolis = True
+    report_twonn_baseline_by_label = False
+    if args.sanity_twonn:
+        # "Honesty" run: remove PCA + trimming biases; keep everything else identical.
+        # Use `replace` to keep the config immutable-ish and make runs easier to reason about.
+        cfg = replace(cfg, pca_dim_for_twonn=0, twonn_trim_frac=0.0, metro_steps=0)
+        do_metropolis = False
+        do_plot = False
+        report_twonn_baseline_by_label = True
 
-    create_visualization(results, evaluation, "protocol_a_final_results.png")
+    results = run_toy_protocol_c(
+        cfg,
+        do_metropolis=do_metropolis,
+        report_twonn_baseline_by_label=report_twonn_baseline_by_label,
+        twonn_baseline_samples_per_label=(args.twonn_baseline_n if args.sanity_twonn else 0),
+    )
 
-    def serialize(obj):
-        if isinstance(obj, (np.bool_, bool)):
-            return bool(obj)
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, dict):
-            return {k: serialize(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [serialize(v) for v in obj]
-        return obj
+    b = results["baseline"]
+    print("\n=== Toy Protocol C Baseline (Ω) ===")
+    print(f"Action type: {cfg.action_type}")
+    print(f"S(entropic)   = {b['S_ent_mean']:.4f} ± {b['S_ent_std']:.4f}")
+    print(f"S(sprinkled)  = {b['S_spr_mean']:.4f} ± {b['S_spr_std']:.4f}")
+    print(f"Corr(S, label) = {b['corr_S_label']:.4f}   (label: 0=entropic, 1=sprinkled)")
+    print("Expectation for a 'good' action: S(sprinkled) < S(entropic) on average.\n")
 
-    payload = {"evaluation": evaluation, "delta": "adaptive" if effective_delta is None else effective_delta}
-    with open("protocol_a_final_data.json", "w") as f:
-        json.dump(serialize(payload), f, indent=2)
+    # Copy/paste-friendly summaries (for quick inspection / sharing)
+    print("p_sprinkled =", np.array2string(results["p_sprinkled"], precision=4, separator=", "))
+    print("mean_id     =", np.array2string(results["mean_id"], precision=4, separator=", "))
+    print("mean_id_x2  =", np.array2string(results["mean_id_x2"], precision=4, separator=", "))
+    print("mean_S      =", np.array2string(results["mean_S"], precision=4, separator=", "))
 
-    print(report)
-    print("\nOutputs:")
-    print("  • protocol_a_final_report.txt")
-    print("  • protocol_a_final_results.png")
-    print("  • protocol_a_final_data.json")
+    if args.sanity_twonn and results.get("twonn_baseline"):
+        tb = results["twonn_baseline"]
+        print(
+            "TwoNN baseline (Ω, unweighted; mean±std; same TwoNN settings as run): "
+            f"entropic={tb['id_ent_mean']:.4f}±{tb['id_ent_std']:.4f} (std, n={tb['id_ent_n']}), "
+            f"sprinkled={tb['id_spr_mean']:.4f}±{tb['id_spr_std']:.4f} (std, n={tb['id_spr_n']}); "
+            f"settings(subsample={tb['twonn_subsample']}, pca_dim={tb['pca_dim']}, trim={tb['trim_frac']})"
+        )
 
-    return results, evaluation
+    if do_plot:
+        plot_results(cfg, results)
 
 
 if __name__ == "__main__":
-    import sys
-    sizes = None
-    n_real = 2
-    seed = 42
-    delta = 0
-    if len(sys.argv) > 1:
-        sizes = [int(x) for x in sys.argv[1].split(",")]
-    if len(sys.argv) > 2:
-        n_real = int(sys.argv[2])
-    if len(sys.argv) > 3:
-        seed = int(sys.argv[3])
-    if len(sys.argv) > 4:
-        delta = int(sys.argv[4])
-
-    main(sizes=sizes, n_realizations=n_real, seed=seed, delta=delta)
+    main()
