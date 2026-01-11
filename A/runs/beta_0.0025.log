@@ -1,0 +1,24 @@
+
+--- Protocol A (Coordinate MCMC over sprinklings) ---
+DIM=4 | NS=[120, 180, 250, 350] | betas=[0.0025, …, 0.0025] (1 points)
+burn=1000 steps=16000 thin=40 chains=5 
+moves=mixed(p_local=0.50, sigma=0.03) 
+k_max=3 | alpha=[1.0, -9.0, 16.0, -8.0] 
+density: fixed rho from (Nref=120,Tref=1.0) -> rho=916.732 
+NOTE: Replace alpha with your true BD/BDG coefficients (incl. smearing if used) for a meaningful physics test. 
+
+N= 120 beta= 0.0025 | T=1.0000 | d=4.000 ± 0.018 ESS≈156.6 acc=0.961 
+N= 180 beta= 0.0025 | T=1.1067 | d=4.010 ± 0.014 ESS≈152.3 acc=0.948 
+N= 250 beta= 0.0025 | T=1.2014 | d=4.021 ± 0.014 ESS≈108.0 acc=0.937 
+N= 350 beta= 0.0025 | T=1.3068 | d=4.004 ± 0.014 ESS≈79.4 acc=0.923 
+
+--- Plateau score (closer to 1 is better) --- 
+beta= 0.0025 | score=0.9546 | mean|d-4|=0.0090 
+
+Saved figure: protocolA_out/protocolA_coordinate_mcmc.png 
+Protocol A interpretation guide: 
+- Sanity check: at beta=0, <d_MM> should be near DIM for all N. 
+- Protocol A success: exists beta* where <d_MM>(beta*,N) ~ 4 and becomes N-stable (plateau), 
+with variance generally decreasing as N increases in that regime. 
+- If acceptance collapses (near 0) or ESS is tiny, increase steps/burn or adjust proposal mix. 
+- For finite-size claims, use --fix_density or --rho so discreteness scale stays fixed across N.

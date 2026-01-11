@@ -1,0 +1,19 @@
+pytest
+============= test session starts ==============
+platform darwin -- Python 3.10.14, pytest-9.0.2, pluggy-1.6.0
+rootdir: /Users/vyron/Documents/Projects/protocols/A
+plugins: hypothesis-6.150.0
+collected 41 items                             
+
+tests/test_bd_action.py ..               [  4%]
+tests/test_causalset_relations.py ....   [ 14%]
+tests/test_density_scaling.py .          [ 17%]
+tests/test_diamond_sampling.py ......... [ 39%]
+....                                     [ 48%]
+tests/test_math_dimension.py ........... [ 75%]
+...                                      [ 82%]
+tests/test_mcmc.py ...                   [ 90%]
+tests/test_property_based.py ..          [ 95%]
+tests/test_proposals.py ..               [100%]
+
+============== 41 passed in 1.86s ==============
